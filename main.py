@@ -34,7 +34,7 @@ def init_db():
 def main_menu(user_id):
     keyboard = [
         [InlineKeyboardButton("Поиск по жанру", callback_data='search_genre'),
-         InlineKeyboardButton("Поиск книги", callback_data='search_title')],  # Добавлена кнопка "Поиск книги"
+         InlineKeyboardButton("Поиск книги", callback_data='search_title')],
         [InlineKeyboardButton("Добавить в прочитанное", callback_data='add_read'),
          InlineKeyboardButton("Добавить в избранное", callback_data='add_favorite')],
         [InlineKeyboardButton("Мои прочитанные", callback_data='show_read'),
@@ -52,7 +52,14 @@ def rating_to_stars(rating):
 
 # Проверка согласия и бана
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    # Используем query.from_user.id для CallbackQuery и message.from_user.id для сообщений
+    if isinstance(update, Update) and update.callback_query:
+        user_id = update.callback_query.from_user.id
+        message = update.callback_query.message
+    else:
+        user_id = update.message.from_user.id
+        message = update.message
+    
     with sqlite3.connect('books.db') as conn:
         c = conn.cursor()
         c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,))
@@ -61,7 +68,7 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not user[0]:  # Не согласен или новый пользователь
         return False
     if user[1] and user[1] > int(time.time()):  # Пользователь забанен
-        await update.effective_message.reply_text(f"Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\nПричина: {user[2]}")
+        await message.reply_text(f"Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\nПричина: {user[2]}")
         return False
     return True
 
@@ -134,7 +141,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     logger.info(f"Обработка callback: {query.data} для пользователя {user_id}")
     
-    if not await check_user(query, context):
+    if not await check_user(update, context):
         return
     
     if query.data == 'search_genre':
@@ -181,8 +188,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with sqlite3.connect('books.db') as conn:
             c = conn.cursor()
             c.execute("UPDATE user_read SET rating = ? WHERE user_id = ? AND book_id = ?", (rating, user_id, book_id))
-            if c.rowcount == 0:  # Если книга не в прочитанных, добавляем
-                c.execute("INSERT INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
+            if c.rowcount == 0:
+                c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
             conn.commit()
         await query.message.reply_text(f"Оценка {rating}★ сохранена.", reply_markup=main_menu(user_id))
     elif query.data == 'main_menu':
@@ -221,6 +228,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("SELECT COUNT(*) FROM books")
             book_count = c.fetchone()[0]
         await query.message.reply_text(f"Статистика:\nПользователей: {user_count}\nКниг в базе: {book_count}", reply_markup=main_menu(user_id))
+    elif query.data == 'select_book_read':
+        await query.message.reply_text("Укажи номер книги из списка прочитанного (1, 2, 3...):")
+        context.user_data['state'] = 'select_book_read'
+    elif query.data == 'select_book_favorite':
+        await query.message.reply_text("Укажи номер книги из списка избранного (1, 2, 3...):")
+        context.user_data['state'] = 'select_book_favorite'
+    elif query.data == 'back_to_select_read':
+        await show_read(query, context)
+    elif query.data == 'back_to_select_favorite':
+        await show_favorites(query, context)
 
 # Обработка текстовых сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,13 +417,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with sqlite3.connect('books.db') as conn:
                 c = conn.cursor()
                 if list_type == 'read':
-                    c.execute("DELETE FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
                     c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
                 else:
-                    c.execute("DELETE FROM user_favorites WHERE user_id = ? AND book_id = ?", (user_id, book_id))
                     c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
                 conn.commit()
-            await update.message.reply_text(f"Книга перемещена в {list_type == 'read' and 'избранное' or 'прочитанное'}.", reply_markup=main_menu(user_id))
+            await update.message.reply_text(f"Книга добавлена в {list_type == 'read' and 'избранное' or 'прочитанное'}.", reply_markup=main_menu(user_id))
+        await msg.delete()
+        context.user_data['state'] = None
+    
+    elif state == 'select_book_read':
+        msg = await update.message.reply_text("⏳ Поиск книги...")
+        await asyncio.sleep(1)
+        with sqlite3.connect('books.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
+            books = c.fetchall()
+        
+        try:
+            index = int(text) - 1
+            if 0 <= index < len(books):
+                book_id, title, description, genres, cover_url, rating = books[index]
+                keyboard = [
+                    [InlineKeyboardButton("Добавить в избранное", callback_data='list_action_move_read'),
+                     InlineKeyboardButton("Оценить", callback_data='list_action_rate_read')],
+                    [InlineKeyboardButton("Выбрать другую", callback_data='back_to_select_read'),
+                     InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+                ]
+                await update.message.reply_photo(
+                    photo=cover_url,
+                    caption=f"**{title}**\n\n{description}\n\nЖанры: {genres}\nОценка: {rating_to_stars(rating)}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await update.message.reply_text("Неверный номер книги.", reply_markup=main_menu(user_id))
+        except ValueError:
+            await update.message.reply_text("Введите корректный номер книги.", reply_markup=main_menu(user_id))
+        await msg.delete()
+        context.user_data['state'] = None
+    
+    elif state == 'select_book_favorite':
+        msg = await update.message.reply_text("⏳ Поиск книги...")
+        await asyncio.sleep(1)
+        with sqlite3.connect('books.db') as conn:
+            c = conn.cursor()
+            c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
+            books = c.fetchall()
+        
+        try:
+            index = int(text) - 1
+            if 0 <= index < len(books):
+                book_id, title, description, genres, cover_url = books[index]
+                c.execute("SELECT rating FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
+                rating = c.fetchone()
+                rating = rating[0] if rating else None
+                keyboard = [
+                    [InlineKeyboardButton("Удалить из избранного", callback_data='list_action_delete_favorite'),
+                     InlineKeyboardButton("Оценить", callback_data='list_action_rate_favorite')],
+                    [InlineKeyboardButton("Выбрать другую", callback_data='back_to_select_favorite'),
+                     InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+                ]
+                await update.message.reply_photo(
+                    photo=cover_url,
+                    caption=f"**{title}**\n\n{description}\n\nЖанры: {genres}\nОценка: {rating_to_stars(rating)}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await update.message.reply_text("Неверный номер книги.", reply_markup=main_menu(user_id))
+        except ValueError:
+            await update.message.reply_text("Введите корректный номер книги.", reply_markup=main_menu(user_id))
         await msg.delete()
         context.user_data['state'] = None
     
@@ -474,7 +552,8 @@ async def show_read(query, context):
             [InlineKeyboardButton("Оценить", callback_data='list_action_rate_read'),
              InlineKeyboardButton("Добавить в избранное", callback_data='list_action_move_read')],
             [InlineKeyboardButton("Удалить", callback_data='list_action_delete_read'),
-             InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+             InlineKeyboardButton("Выбрать книгу", callback_data='select_book_read')],
+            [InlineKeyboardButton("Главное меню", callback_data='main_menu')]
         ]
         await query.message.reply_text(list_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -500,7 +579,8 @@ async def show_favorites(query, context):
             [InlineKeyboardButton("Оценить", callback_data='list_action_rate_favorite'),
              InlineKeyboardButton("Добавить в прочитанное", callback_data='list_action_move_favorite')],
             [InlineKeyboardButton("Удалить", callback_data='list_action_delete_favorite'),
-             InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+             InlineKeyboardButton("Выбрать книгу", callback_data='select_book_favorite')],
+            [InlineKeyboardButton("Главное меню", callback_data='main_menu')]
         ]
         await query.message.reply_text(list_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -541,7 +621,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, handle_message))
     
     # Установка времени для Москвы (UTC+3)
-    moscow_time = time(hour=9, tzinfo=tzoffset(10800))  # 9 утра по Москве, убрано None
+    moscow_time = time(hour=9, tzinfo=tzoffset(10800))  # 9 утра по Москве
     application.job_queue.run_daily(daily_recommendation, moscow_time)
     
     application.run_polling()
