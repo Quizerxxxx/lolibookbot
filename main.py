@@ -144,12 +144,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not agreed:
             keyboard = [
-                [InlineKeyboardButton("✅ Согласен", callback_data='agree_policy'),
-                 InlineKeyboardButton("❌ Отказ", callback_data='refuse_policy')]
+                [InlineKeyboardButton("✅ Согласна", callback_data='agree_policy'),
+                 InlineKeyboardButton("❌ Отказываюсь", callback_data='refuse_policy')]
             ]
-            await update.message.reply_text("📜 *Пожалуйста, согласитесь с политикой использования бота*\n(запрашивается только один раз):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text("📜 *Пожалуйста, согласитесь с тем, что в наших отношениях я главный*\n(запрашивается только один раз и сохраняется в вечной базе данных):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
         else:
-            await update.message.reply_text("📚 *Добро пожаловать в бот для книг!*\nЯ использую Open Library для поиска. Выберите действие:", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text("📚 *Добро пожаловать в бот для книг!*\nНаписан Lolip1e специально для r1shy. Выберите действие:", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Ошибка в /start: {e}")
         await update.message.reply_text("⚠️ *Ошибка сервера, попробуйте позже.*", parse_mode=ParseMode.MARKDOWN)
@@ -245,7 +245,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("⚠️ *Ошибка сервера, попробуйте позже.*", parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'refuse_policy':
             logger.info(f"Пользователь {user_id} отказался от политики")
-            await query.message.reply_text("❌ *Вы отказались от политики.*\nИспользование бота невозможно.")
+            await query.message.reply_text("❌ *Вы отказались от признания.*\nИспользование бота невозможно.")
         return
 
     if not await check_user(update, context):
