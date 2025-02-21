@@ -3,6 +3,7 @@ import random
 import aiohttp
 import logging
 import os
+import time as time_module  # Явный импорт модуля time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -23,21 +24,25 @@ DB_CONN_STRING = os.getenv('DB_CONN_STRING', 'postgresql://loli_db_user:UxaiJ1HL
 
 # Инициализация базы данных
 def init_db():
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS books 
-                 (id TEXT PRIMARY KEY, title TEXT, description TEXT, genres TEXT, cover_url TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_read 
-                 (user_id BIGINT, book_id TEXT, rating INTEGER, PRIMARY KEY (user_id, book_id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_favorites 
-                 (user_id BIGINT, book_id TEXT, PRIMARY KEY (user_id, book_id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id BIGINT PRIMARY KEY, username TEXT, agreed INTEGER DEFAULT 0, banned_until BIGINT DEFAULT 0, ban_reason TEXT, requests INTEGER DEFAULT 0, last_request BIGINT DEFAULT 0)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS search_history 
-                 (user_id BIGINT, query TEXT, timestamp BIGINT)''')
-    conn.commit()
-    conn.close()
-    logger.info("База данных PostgreSQL инициализирована")
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS books 
+                     (id TEXT PRIMARY KEY, title TEXT, description TEXT, genres TEXT, cover_url TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_read 
+                     (user_id BIGINT, book_id TEXT, rating INTEGER, PRIMARY KEY (user_id, book_id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_favorites 
+                     (user_id BIGINT, book_id TEXT, PRIMARY KEY (user_id, book_id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS users 
+                     (user_id BIGINT PRIMARY KEY, username TEXT, agreed INTEGER DEFAULT 0, banned_until BIGINT DEFAULT 0, ban_reason TEXT, requests INTEGER DEFAULT 0, last_request BIGINT DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS search_history 
+                     (user_id BIGINT, query TEXT, timestamp BIGINT)''')
+        conn.commit()
+        logger.info("База данных PostgreSQL инициализирована")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации базы данных: {e}")
+    finally:
+        conn.close()
 
 # Главное меню
 def main_menu(user_id):
@@ -62,28 +67,32 @@ def rating_to_stars(rating):
 
 # Проверка лимита запросов
 def check_rate_limit(user_id):
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    c.execute("SELECT requests, last_request FROM users WHERE user_id = %s", (user_id,))
-    user = c.fetchone()
-    current_time = int(time.time())
-    
-    if not user or current_time - user[1] > REQUEST_WINDOW:
-        c.execute("INSERT INTO users (user_id, requests, last_request) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET requests = 1, last_request = %s", 
-                  (user_id, current_time, current_time))
-        conn.commit()
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        c.execute("SELECT requests, last_request FROM users WHERE user_id = %s", (user_id,))
+        user = c.fetchone()
+        current_time = int(time_module.time())  # Используем time_module
+        
+        if not user or current_time - user[1] > REQUEST_WINDOW:
+            c.execute("INSERT INTO users (user_id, requests, last_request) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET requests = 1, last_request = %s", 
+                      (user_id, current_time, current_time))
+            conn.commit()
+            conn.close()
+            return True
+        
+        requests, last_request = user
+        if requests < REQUEST_LIMIT:
+            c.execute("UPDATE users SET requests = requests + 1 WHERE user_id = %s", (user_id,))
+            conn.commit()
+            conn.close()
+            return True
+        logger.warning(f"Пользователь {user_id} превысил лимит запросов")
         conn.close()
-        return True
-    
-    requests, last_request = user
-    if requests < REQUEST_LIMIT:
-        c.execute("UPDATE users SET requests = requests + 1 WHERE user_id = %s", (user_id,))
-        conn.commit()
-        conn.close()
-        return True
-    logger.warning(f"Пользователь {user_id} превысил лимит запросов")
-    conn.close()
-    return False
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки лимита запросов: {e}")
+        return False
 
 # Проверка согласия и бана
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,42 +107,52 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("🚫 Вы превысили лимит запросов (60 в минуту). Подождите немного!", parse_mode=ParseMode.MARKDOWN)
         return False
     
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = %s", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    
-    if not user:  # Новый пользователь
-        return True
-    if user[1] and user[1] > int(time.time()):  # Пользователь забанен
-        await message.reply_text(f"🚫 Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\n*Причина:* {user[2]}", parse_mode=ParseMode.MARKDOWN)
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = %s", (user_id,))
+        user = c.fetchone()
+        conn.close()
+        
+        if not user:  # Новый пользователь
+            return True
+        if user[1] and user[1] > int(time_module.time()):  # Пользователь забанен
+            await message.reply_text(f"🚫 Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\n*Причина:* {user[2]}", parse_mode=ParseMode.MARKDOWN)
+            return False
+        if user[0] == 1:  # Уже согласен
+            return True
         return False
-    if user[0] == 1:  # Уже согласен
-        return True
-    return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки пользователя: {e}")
+        await message.reply_text("⚠️ *Ошибка сервера, попробуйте позже.*", parse_mode=ParseMode.MARKDOWN)
+        return False
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     username = update.message.from_user.username
     
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    c.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, username))
-    c.execute("SELECT agreed FROM users WHERE user_id = %s", (user_id,))
-    agreed = c.fetchone()[0]
-    conn.commit()
-    conn.close()
-    
-    if not agreed:
-        keyboard = [
-            [InlineKeyboardButton("✅ Согласен", callback_data='agree_policy'),
-             InlineKeyboardButton("❌ Отказ", callback_data='refuse_policy')]
-        ]
-        await update.message.reply_text("📜 *Пожалуйста, согласитесь с политикой использования бота*\n(запрашивается только один раз):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("📚 *Добро пожаловать в бот для книг!*\nЯ использую Open Library для поиска. Выберите действие:", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        # Создаём запись пользователя с agreed=0, если её нет
+        c.execute("INSERT INTO users (user_id, username, agreed) VALUES (%s, %s, 0) ON CONFLICT (user_id) DO UPDATE SET username = %s", (user_id, username, username))
+        c.execute("SELECT agreed FROM users WHERE user_id = %s", (user_id,))
+        agreed = c.fetchone()[0]
+        conn.commit()
+        conn.close()
+        
+        if not agreed:
+            keyboard = [
+                [InlineKeyboardButton("✅ Согласен", callback_data='agree_policy'),
+                 InlineKeyboardButton("❌ Отказ", callback_data='refuse_policy')]
+            ]
+            await update.message.reply_text("📜 *Пожалуйста, согласитесь с политикой использования бота*\n(запрашивается только один раз):", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("📚 *Добро пожаловать в бот для книг!*\nЯ использую Open Library для поиска. Выберите действие:", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Ошибка в /start: {e}")
+        await update.message.reply_text("⚠️ *Ошибка сервера, попробуйте позже.*", parse_mode=ParseMode.MARKDOWN)
 
 # Поиск книги через Open Library API
 async def search_book_by_title_or_genre(query, is_genre=False, author=None):
@@ -173,12 +192,15 @@ async def search_book_by_title_or_genre(query, is_genre=False, author=None):
 
 # Кэширование книги
 def cache_book(book):
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    c.execute("INSERT INTO books (id, title, description, genres, cover_url) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
-              (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
-    conn.commit()
-    conn.close()
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        c.execute("INSERT INTO books (id, title, description, genres, cover_url) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                  (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка кэширования книги: {e}")
 
 # Резервное копирование базы (опционально, для PostgreSQL не требуется локально)
 async def backup_database(context: ContextTypes.DEFAULT_TYPE):
@@ -186,17 +208,20 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
 
 # Сброс базы данных
 def reset_database(user_id=None):
-    conn = psycopg2.connect(DB_CONN_STRING)
-    c = conn.cursor()
-    if user_id:
-        c.execute("DELETE FROM user_read WHERE user_id = %s", (user_id,))
-        c.execute("DELETE FROM user_favorites WHERE user_id = %s", (user_id,))
-        c.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
-        c.execute("DELETE FROM search_history WHERE user_id = %s", (user_id,))
-    else:
-        c.execute("TRUNCATE TABLE books, user_read, user_favorites, users, search_history RESTART IDENTITY")
-    conn.commit()
-    conn.close()
+    try:
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        if user_id:
+            c.execute("DELETE FROM user_read WHERE user_id = %s", (user_id,))
+            c.execute("DELETE FROM user_favorites WHERE user_id = %s", (user_id,))
+            c.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+            c.execute("DELETE FROM search_history WHERE user_id = %s", (user_id,))
+        else:
+            c.execute("TRUNCATE TABLE books, user_read, user_favorites, users, search_history RESTART IDENTITY")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка сброса базы данных: {e}")
 
 # Обработка кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,13 +232,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data in ['agree_policy', 'refuse_policy']:
         if query.data == 'agree_policy':
-            conn = psycopg2.connect(DB_CONN_STRING)
-            c = conn.cursor()
-            c.execute("UPDATE users SET agreed = 1 WHERE user_id = %s", (user_id,))
-            conn.commit()
-            conn.close()
-            logger.info(f"Пользователь {user_id} согласился с политикой")
-            await query.message.reply_text("✅ *Спасибо за согласие!*\nТеперь вы можете использовать бот.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            try:
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("UPDATE users SET agreed = 1 WHERE user_id = %s", (user_id,))
+                conn.commit()
+                conn.close()
+                logger.info(f"Пользователь {user_id} согласился с политикой")
+                await query.message.reply_text("✅ *Спасибо за согласие!*\nТеперь вы можете использовать бот.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.error(f"Ошибка обновления согласия: {e}")
+                await query.message.reply_text("⚠️ *Ошибка сервера, попробуйте позже.*", parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'refuse_policy':
             logger.info(f"Пользователь {user_id} отказался от политики")
             await query.message.reply_text("❌ *Вы отказались от политики.*\nИспользование бота невозможно.")
@@ -407,7 +436,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['last_found_book'] = book
                 conn = psycopg2.connect(DB_CONN_STRING)
                 c = conn.cursor()
-                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time_module.time())))
                 conn.commit()
                 conn.close()
                 keyboard = [
@@ -434,7 +463,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['last_found_book'] = book
                 conn = psycopg2.connect(DB_CONN_STRING)
                 c = conn.cursor()
-                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time_module.time())))
                 conn.commit()
                 conn.close()
                 keyboard = [
@@ -464,7 +493,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data['last_found_book'] = book
                 conn = psycopg2.connect(DB_CONN_STRING)
                 c = conn.cursor()
-                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time_module.time())))
                 conn.commit()
                 conn.close()
                 keyboard = [
@@ -554,7 +583,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.delete()
                 return
             
-            book_id = f"manual_{user_id}_{int(time.time())}"
+            book_id = f"manual_{user_id}_{int(time_module.time())}"
             book = {'id': book_id, 'title': title, 'description': description, 'genres': 'Не указаны', 'cover_url': cover_url}
             cache_book(book)
             conn = psycopg2.connect(DB_CONN_STRING)
@@ -749,7 +778,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1)
             conn = psycopg2.connect(DB_CONN_STRING)
             c = conn.cursor()
-            c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time.time()),))
+            c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time_module.time()),))
             users = c.fetchall()
             conn.close()
             for uid in users:
@@ -783,7 +812,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ban_user_id = context.user_data['ban_user_id']
             duration = context.user_data['ban_duration']
             reason = text
-            ban_until = int(time.time()) + duration * 86400
+            ban_until = int(time_module.time()) + duration * 86400
             conn = psycopg2.connect(DB_CONN_STRING)
             c = conn.cursor()
             c.execute("UPDATE users SET banned_until = %s, ban_reason = %s WHERE user_id = %s", (ban_until, reason, ban_user_id))
@@ -912,7 +941,7 @@ async def show_favorites(query, context, page):
 async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
     conn = psycopg2.connect(DB_CONN_STRING)
     c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time.time()),))
+    c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time_module.time()),))
     users = c.fetchall()
     conn.close()
     
@@ -938,7 +967,7 @@ async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAHTX8aDvKyzbLdDeqfA2zNBzAMcUw5xVMA')).build()
+    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAEW3i-MNV1eBcm8azAxOwcByP07wDkKlaU')).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("read", read_command))
@@ -951,7 +980,7 @@ def main():
     # Установка времени для Москвы (UTC+3)
     moscow_time = time(hour=9, tzinfo=tzoffset(10800))  # 9 утра по Москве
     application.job_queue.run_daily(daily_recommendation, moscow_time)
-    application.job_queue.run_daily(backup_database, time(hour=0, tzinfo=tzoffset(10800)))  # Ежедневный бэкап в полночь
+    application.job_queue.run_daily(backup_database, time(hour=0, tzinfo=tzoffset(10800)))  # Лог бэкапа
     
     application.run_polling()
 
