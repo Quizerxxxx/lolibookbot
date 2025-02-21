@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = 123456789
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
-GITHUB_REPO = "https://github.com/<ваш_пользователь>/<ваш_репозиторий>.git"  # Замените на ваш репозиторий
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '<ваш_токен>')  # Добавьте токен в переменные окружения Render
+GITHUB_REPO = "https://github.com/Quizerxxxx/LoliBookDB.git"  # Замените на ваш репозиторий
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
 
 # Инициализация базы данных
 def init_db():
