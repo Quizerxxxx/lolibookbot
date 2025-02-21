@@ -5,7 +5,7 @@ import logging
 import os
 import git
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode  # Исправленный импорт
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, time, timedelta
 import asyncio
@@ -16,11 +16,12 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ID администратора (замените на ваш)
-ADMIN_ID = 486000906
+ADMIN_ID = 123456789
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
-GITHUB_REPO = "https://github.com/Quizerxxxx/LoliBookDB.git"  # Замените на ваш репозиторий
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
+GITHUB_REPO = "https://github.com/<ваш_пользователь>/<ваш_репозиторий>.git"  # Замените на ваш репозиторий
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '<ваш_токен>')  # Добавьте токен в переменные окружения Render
+BRANCH = 'main'  # Основная ветка
 
 # Инициализация базы данных
 def init_db():
@@ -44,21 +45,28 @@ def init_db():
 # Синхронизация базы с GitHub
 def sync_db_with_github(action="push"):
     repo_dir = '.'
-    repo = git.Repo(repo_dir)
-    
-    if action == "pull":
-        logger.info("Загружаем базу данных из GitHub")
-        repo.git.pull()
-        if os.path.exists('books.db') and os.path.getsize('books.db') > 0:
-            logger.info("База данных успешно загружена")
-        else:
-            logger.info("База данных пуста или отсутствует, инициализируем новую")
-            init_db()
-    elif action == "push":
-        logger.info("Синхронизируем базу данных с GitHub")
-        repo.git.add('books.db')
-        repo.git.commit(m=f"Update database {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        repo.git.push()
+    try:
+        repo = git.Repo(repo_dir)
+        
+        if action == "pull":
+            logger.info("Загружаем базу данных из GitHub")
+            origin = repo.remotes.origin
+            origin.pull(BRANCH)  # Явно указываем ветку
+            if os.path.exists('books.db') and os.path.getsize('books.db') > 0:
+                logger.info("База данных успешно загружена")
+            else:
+                logger.info("База данных пуста или отсутствует, инициализируем новую")
+                init_db()
+        elif action == "push":
+            logger.info("Синхронизируем базу данных с GitHub")
+            repo.git.add('books.db')
+            if repo.is_dirty():
+                repo.git.commit(m=f"Update database {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                repo.git.push('origin', BRANCH)  # Явно указываем ветку
+            else:
+                logger.info("Нет изменений для коммита")
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации с GitHub: {e}")
 
 # Главное меню
 def main_menu(user_id):
@@ -956,12 +964,13 @@ def main():
     if not os.path.exists('.git'):
         logger.info("Инициализация Git репозитория")
         repo = git.Repo.init()
+        repo.git.checkout(b=BRANCH)  # Создаём ветку main
         with open('README.md', 'w') as f:
             f.write("# Book Bot Database\nThis repository stores the SQLite database for the Telegram Book Bot.")
         repo.git.add('README.md')
         repo.git.commit(m="Initial commit")
         repo.create_remote('origin', GITHUB_REPO)
-        repo.git.push('--set-upstream', 'origin', 'master')
+        repo.git.push('--set-upstream', 'origin', BRANCH)
     
     # Загрузка базы данных при запуске
     sync_db_with_github("pull")
