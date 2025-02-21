@@ -2,10 +2,12 @@ import sqlite3
 import random
 import aiohttp
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+import os
+import git
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode  # Исправленный импорт
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, time, timedelta
-import os
 import asyncio
 import shutil
 
@@ -14,12 +16,16 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ID администратора (замените на ваш)
-ADMIN_ID = 486000906
+ADMIN_ID = 123456789
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
+GITHUB_REPO = "https://github.com/<ваш_пользователь>/<ваш_репозиторий>.git"  # Замените на ваш репозиторий
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '<ваш_токен>')  # Добавьте токен в переменные окружения Render
 
 # Инициализация базы данных
 def init_db():
+    if not os.path.exists('books.db'):
+        logger.info("Создаём новую базу данных")
     conn = sqlite3.connect('books.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS books 
@@ -34,6 +40,25 @@ def init_db():
                  (user_id INTEGER, query TEXT, timestamp INTEGER)''')
     conn.commit()
     conn.close()
+
+# Синхронизация базы с GitHub
+def sync_db_with_github(action="push"):
+    repo_dir = '.'
+    repo = git.Repo(repo_dir)
+    
+    if action == "pull":
+        logger.info("Загружаем базу данных из GitHub")
+        repo.git.pull()
+        if os.path.exists('books.db') and os.path.getsize('books.db') > 0:
+            logger.info("База данных успешно загружена")
+        else:
+            logger.info("База данных пуста или отсутствует, инициализируем новую")
+            init_db()
+    elif action == "push":
+        logger.info("Синхронизируем базу данных с GitHub")
+        repo.git.add('books.db')
+        repo.git.commit(m=f"Update database {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        repo.git.push()
 
 # Главное меню
 def main_menu(user_id):
@@ -87,7 +112,7 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
     
     if not check_rate_limit(user_id):
-        await message.reply_text("🚫 Вы превысили лимит запросов (60 в минуту). Подождите немного!")
+        await message.reply_text("🚫 Вы превысили лимит запросов (60 в минуту). Подождите немного!", parse_mode=ParseMode.MARKDOWN)
         return False
     
     with sqlite3.connect('books.db') as conn:
@@ -167,12 +192,32 @@ def cache_book(book):
         c.execute("INSERT OR IGNORE INTO books (id, title, description, genres, cover_url) VALUES (?, ?, ?, ?, ?)",
                   (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
         conn.commit()
+    sync_db_with_github("push")  # Синхронизация после изменения
 
 # Резервное копирование базы
 async def backup_database(context: ContextTypes.DEFAULT_TYPE):
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     shutil.copy('books.db', f'books_backup_{timestamp}.db')
     logger.info(f"Создан бэкап базы: books_backup_{timestamp}.db")
+    sync_db_with_github("push")  # Синхронизация бэкапа
+
+# Сброс базы данных
+def reset_database(user_id=None):
+    with sqlite3.connect('books.db') as conn:
+        c = conn.cursor()
+        if user_id:
+            c.execute("DELETE FROM user_read WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM user_favorites WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            c.execute("DELETE FROM search_history WHERE user_id = ?", (user_id,))
+        else:
+            c.execute("DELETE FROM books")
+            c.execute("DELETE FROM user_read")
+            c.execute("DELETE FROM user_favorites")
+            c.execute("DELETE FROM users")
+            c.execute("DELETE FROM search_history")
+        conn.commit()
+    sync_db_with_github("push")  # Синхронизация после сброса
 
 # Обработка кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,6 +237,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif query.data == 'refuse_policy':
             logger.info(f"Пользователь {user_id} отказался от политики")
             await query.message.reply_text("❌ *Вы отказались от политики.*\nИспользование бота невозможно.")
+        sync_db_with_github("push")  # Синхронизация после изменения
         return
 
     if not await check_user(update, context):
@@ -230,7 +276,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     c = conn.cursor()
                     c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                     conn.commit()
-                await query.message.reply_text(f"📖 Книга *{book['title']}* добавлена в прочитанное.\nПопробуйте */search* для поиска!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                await query.message.reply_text(f"📖 Книга *{book['title']}* добавлена в прочитанное.\nПопробуйте */search*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                sync_db_with_github("push")
         elif query.data == 'add_found_to_favorite':
             book = context.user_data.get('last_found_book')
             if book:
@@ -238,7 +285,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     c = conn.cursor()
                     c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                     conn.commit()
-                await query.message.reply_text(f"❤️ Книга *{book['title']}* добавлена в избранное.\nПопробуйте */search* для поиска!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                await query.message.reply_text(f"❤️ Книга *{book['title']}* добавлена в избранное.\nПопробуйте */search*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                sync_db_with_github("push")
         elif query.data.startswith('list_action_'):
             action, list_type = query.data.split('_')[2], query.data.split('_')[3]
             context.user_data['list_action'] = action
@@ -255,6 +303,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
                 conn.commit()
             await query.message.reply_text(f"⭐ Оценка {rating}★ сохранена.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            sync_db_with_github("push")
         elif query.data == 'main_menu':
             await query.message.reply_text("🔙 *Возвращаемся в главное меню:*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'admin_panel':
@@ -266,6 +315,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
                     [InlineKeyboardButton("📜 Логи", callback_data='admin_logs'),
                      InlineKeyboardButton("🔄 Восстановить бэкап", callback_data='admin_restore')],
+                    [InlineKeyboardButton("🗑️ Сброс базы", callback_data='admin_reset_all'),
+                     InlineKeyboardButton("👤 Сброс пользователя", callback_data='admin_reset_user')],
                     [InlineKeyboardButton("🔙 Главное меню", callback_data='main_menu')]
                 ]
                 await query.message.reply_text("🔧 *Админ-панель:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
@@ -310,6 +361,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             backup_file = query.data.split('_', 1)[1]
             shutil.copy(backup_file, 'books.db')
             await query.message.reply_text(f"🔄 *База данных восстановлена из {backup_file}.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            sync_db_with_github("push")
+        elif query.data == 'admin_reset_all':
+            reset_database()
+            await query.message.reply_text("🗑️ *База данных полностью сброшена.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+        elif query.data == 'admin_reset_user':
+            await query.message.reply_text("👤 Введите ID пользователя для сброса данных:", parse_mode=ParseMode.MARKDOWN)
+            context.user_data['state'] = 'admin_reset_user_id'
         elif query.data == 'select_book_read':
             await query.message.reply_text("🔢 Укажи номер книги из списка прочитанного (1, 2, 3...):", parse_mode=ParseMode.MARKDOWN)
             context.user_data['state'] = 'select_book_read'
@@ -417,7 +475,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN
                 )
             else:
-                await update.message.reply_text("📚 *Книга не найдена.*\nПопробуйте */search*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text("📚 *Книга не найдена.*\nУкажи описание:", parse_mode=ParseMode.MARKDOWN)
+                context.user_data['manual_title'] = text
+                context.user_data['manual_list'] = 'title'
+                context.user_data['state'] = 'manual_description'
             await msg.delete()
         
         elif state == 'search_author':
@@ -457,6 +518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
                     conn.commit()
                     await update.message.reply_text(f"📖 Книга *{text}* добавлена в прочитанное.\nПопробуйте */read*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                    sync_db_with_github("push")
                 else:
                     book = await search_book_by_title_or_genre(text)
                     if book:
@@ -464,6 +526,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                         conn.commit()
                         await update.message.reply_text(f"📖 Книга *{text}* добавлена в прочитанное.\nПопробуйте */read*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                        sync_db_with_github("push")
                     else:
                         context.user_data['manual_title'] = text
                         context.user_data['manual_list'] = 'read'
@@ -482,6 +545,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
                     conn.commit()
                     await update.message.reply_text(f"❤️ Книга *{text}* добавлена в избранное.\nПопробуйте */favorites*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                    sync_db_with_github("push")
                 else:
                     book = await search_book_by_title_or_genre(text)
                     if book:
@@ -489,6 +553,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                         conn.commit()
                         await update.message.reply_text(f"❤️ Книга *{text}* добавлена в избранное.\nПопробуйте */favorites*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                        sync_db_with_github("push")
                     else:
                         context.user_data['manual_title'] = text
                         context.user_data['manual_list'] = 'favorite'
@@ -529,6 +594,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📚 Книга *{title}* добавлена в {list_type == 'read' and 'прочитанное' or 'избранное'}.\nПопробуйте */{'read' if list_type == 'read' else 'favorites'}*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await msg.delete()
             context.user_data['state'] = None
+            sync_db_with_github("push")
         
         elif state == 'list_action_select':
             msg = await update.message.reply_text("⏳ *Обработка...*", parse_mode=ParseMode.MARKDOWN)
@@ -568,6 +634,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c.execute("DELETE FROM user_favorites WHERE user_id = ? AND book_id = ?", (user_id, book_id))
                     conn.commit()
                 await update.message.reply_text(f"🗑️ Книга удалена из {list_type == 'read' and 'прочитанного' or 'избранного'}.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                sync_db_with_github("push")
             elif action == 'move':
                 with sqlite3.connect('books.db') as conn:
                     c = conn.cursor()
@@ -577,6 +644,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
                     conn.commit()
                 await update.message.reply_text(f"➡️ Книга добавлена в {list_type == 'read' and 'избранное' or 'прочитанное'}.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+                sync_db_with_github("push")
             await msg.delete()
             context.user_data['state'] = None
         
@@ -652,7 +720,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1)
             with sqlite3.connect('books.db') as conn:
                 c = conn.cursor()
-                c.execute("SELECT b.id, b.title FROM books WHERE user_id = ?", (user_id,))
+                c.execute("SELECT id, title FROM books WHERE id LIKE 'manual_%'", ())  # Только вручную добавленные книги
                 books = c.fetchall()
             
             try:
@@ -697,6 +765,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📝 *Книга обновлена!*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await msg.delete()
             context.user_data['state'] = None
+            sync_db_with_github("push")
         
         elif state == 'admin_broadcast_message' and user_id == ADMIN_ID:
             msg = await update.message.reply_text("⏳ *Отправка рассылки...*", parse_mode=ParseMode.MARKDOWN)
@@ -744,6 +813,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🚫 Пользователь {ban_user_id} заблокирован до {datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')} по причине: *{reason}*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await context.bot.send_message(chat_id=ban_user_id, text=f"🚫 *Вы заблокированы до {datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')}*\n*Причина:* {reason}", parse_mode=ParseMode.MARKDOWN)
             context.user_data['state'] = None
+            sync_db_with_github("push")
         
         elif state == 'admin_unban_id' and user_id == ADMIN_ID:
             try:
@@ -754,6 +824,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     conn.commit()
                 await update.message.reply_text(f"✅ Пользователь {unban_user_id} разблокирован.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
                 await context.bot.send_message(chat_id=unban_user_id, text="✅ *Вы были разблокированы!*", parse_mode=ParseMode.MARKDOWN)
+                context.user_data['state'] = None
+                sync_db_with_github("push")
+            except ValueError:
+                await update.message.reply_text("❌ *Введите корректный ID пользователя.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+        
+        elif state == 'admin_reset_user_id' and user_id == ADMIN_ID:
+            try:
+                reset_user_id = int(text)
+                reset_database(reset_user_id)
+                await update.message.reply_text(f"🗑️ Данные пользователя {reset_user_id} сброшены.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
                 context.user_data['state'] = None
             except ValueError:
                 await update.message.reply_text("❌ *Введите корректный ID пользователя.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
@@ -872,6 +952,20 @@ async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 def main():
+    # Инициализация Git репозитория
+    if not os.path.exists('.git'):
+        logger.info("Инициализация Git репозитория")
+        repo = git.Repo.init()
+        with open('README.md', 'w') as f:
+            f.write("# Book Bot Database\nThis repository stores the SQLite database for the Telegram Book Bot.")
+        repo.git.add('README.md')
+        repo.git.commit(m="Initial commit")
+        repo.create_remote('origin', GITHUB_REPO)
+        repo.git.push('--set-upstream', 'origin', 'master')
+    
+    # Загрузка базы данных при запуске
+    sync_db_with_github("pull")
+    
     init_db()
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAH0x9rsdU5Fv3aRJhlZ1zF_mdlSTFffHos')).build()
     
