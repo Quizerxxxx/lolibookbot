@@ -1,11 +1,16 @@
 import sqlite3
 import random
 import aiohttp
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, time
 import os
 import asyncio
+
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Инициализация базы данных
 def init_db():
@@ -60,6 +65,7 @@ async def search_book_by_title_or_genre(query, is_genre=False):
             url = f"https://openlibrary.org/search.json?q={query.replace(' ', '+')}&limit=1"
         async with session.get(url) as response:
             if response.status != 200:
+                logger.error(f"Ошибка API: {response.status}")
                 return None
             data = await response.json()
             works = data.get('works') if is_genre else data.get('docs')
@@ -73,6 +79,7 @@ async def search_book_by_title_or_genre(query, is_genre=False):
             detail_url = f"https://openlibrary.org/works/{book_id}.json"
             async with session.get(detail_url) as detail_response:
                 if detail_response.status != 200:
+                    logger.error(f"Ошибка получения деталей книги: {detail_response.status}")
                     return None
                 detail_data = await detail_response.json()
                 description = detail_data.get('description', 'Нет описания') if isinstance(detail_data.get('description'), str) else 'Нет описания'
@@ -96,6 +103,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    logger.info(f"Обработка callback: {query.data} для пользователя {user_id}")
     
     if query.data == 'search_genre':
         await query.message.reply_text("Укажи жанр (например, 'Фэнтези'):")
@@ -132,12 +140,23 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['list_type'] = list_type
         await query.message.reply_text("Укажи номер книги из списка (1, 2, 3...) или её название:")
         context.user_data['state'] = 'list_action_select'
+    elif query.data.startswith('rate_'):
+        _, book_id, rating = query.data.split('_')
+        rating = int(rating)
+        with sqlite3.connect('books.db') as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
+            conn.commit()
+        await query.message.reply_text(f"Оценка {rating}★ сохранена.", reply_markup=main_menu())
+    elif query.data == 'main_menu':
+        await query.message.reply_text("Возвращаемся в главное меню.", reply_markup=main_menu())
 
 # Обработка текстовых сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     state = context.user_data.get('state')
     user_id = update.message.from_user.id
+    logger.info(f"Получено сообщение: {text} в состоянии {state} от {user_id}")
     
     if state == 'search_genre':
         msg = await update.message.reply_text("⏳ Поиск книги...")
@@ -298,55 +317,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Показать прочитанное
 async def show_read(query, context):
     user_id = query.from_user.id
+    logger.info(f"Показ списка прочитанного для {user_id}")
     with sqlite3.connect('books.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
+        c.execute("SELECT b.id, b.title, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
         books = c.fetchall()
     
     if books:
-        for i, book in enumerate(books, 1):
-            book_id, title, description, genres, cover_url, rating = book
-            keyboard = [
-                [InlineKeyboardButton(f"Оценить ({rating_to_stars(rating)})", callback_data=f'list_action_rate_read'),
-                 InlineKeyboardButton("Добавить в избранное", callback_data=f'list_action_move_read')],
-                [InlineKeyboardButton("Удалить", callback_data=f'list_action_delete_read'),
-                 InlineKeyboardButton("Главное меню", callback_data='main_menu')]
-            ]
-            await query.message.reply_photo(
-                photo=cover_url,
-                caption=f"{i}. **{title}**\n\n{description}\n\nЖанры: {genres}\nОценка: {rating_to_stars(rating)}",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        await query.message.reply_text("Список прочитанного выше.", reply_markup=main_menu())
+        list_text = "Список прочитанного:\n"
+        for i, (book_id, title, rating) in enumerate(books, 1):
+            list_text += f"{i}. {title} - {rating_to_stars(rating)}\n"
+        keyboard = [
+            [InlineKeyboardButton("Оценить", callback_data='list_action_rate_read'),
+             InlineKeyboardButton("Добавить в избранное", callback_data='list_action_move_read')],
+            [InlineKeyboardButton("Удалить", callback_data='list_action_delete_read'),
+             InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+        ]
+        await query.message.reply_text(list_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await query.message.reply_text("Список прочитанного пуст.", reply_markup=main_menu())
 
 # Показать избранное
 async def show_favorites(query, context):
     user_id = query.from_user.id
+    logger.info(f"Показ списка избранного для {user_id}")
     with sqlite3.connect('books.db') as conn:
         c = conn.cursor()
-        c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
+        c.execute("SELECT b.id, b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
         books = c.fetchall()
     
     if books:
-        for i, book in enumerate(books, 1):
-            book_id, title, description, genres, cover_url = book
+        list_text = "Список избранного:\n"
+        for i, (book_id, title) in enumerate(books, 1):
             c.execute("SELECT rating FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
             rating = c.fetchone()
             rating = rating[0] if rating else None
-            keyboard = [
-                [InlineKeyboardButton(f"Оценить ({rating_to_stars(rating)})", callback_data=f'list_action_rate_favorite'),
-                 InlineKeyboardButton("Добавить в прочитанное", callback_data=f'list_action_move_favorite')],
-                [InlineKeyboardButton("Удалить", callback_data=f'list_action_delete_favorite'),
-                 InlineKeyboardButton("Главное меню", callback_data='main_menu')]
-            ]
-            await query.message.reply_photo(
-                photo=cover_url,
-                caption=f"{i}. **{title}**\n\n{description}\n\nЖанры: {genres}\nОценка: {rating_to_stars(rating)}",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        await query.message.reply_text("Список избранного выше.", reply_markup=main_menu())
+            logger.info(f"Книга {i}: {title}, рейтинг: {rating}")
+            list_text += f"{i}. {title} - {rating_to_stars(rating)}\n"
+        keyboard = [
+            [InlineKeyboardButton("Оценить", callback_data='list_action_rate_favorite'),
+             InlineKeyboardButton("Добавить в прочитанное", callback_data='list_action_move_favorite')],
+            [InlineKeyboardButton("Удалить", callback_data='list_action_delete_favorite'),
+             InlineKeyboardButton("Главное меню", callback_data='main_menu')]
+        ]
+        await query.message.reply_text(list_text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await query.message.reply_text("Список избранного пуст.", reply_markup=main_menu())
 
