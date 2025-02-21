@@ -51,8 +51,7 @@ def rating_to_stars(rating):
     return "★" * rating + "☆" * (5 - rating)
 
 # Проверка согласия и бана
-async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Используем query.from_user.id для CallbackQuery и message.from_user.id для сообщений
+async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE, allow_policy_check=False):
     if isinstance(update, Update) and update.callback_query:
         user_id = update.callback_query.from_user.id
         message = update.callback_query.message
@@ -60,15 +59,19 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.message.from_user.id
         message = update.message
     
+    logger.info(f"Проверка пользователя {user_id}, allow_policy_check={allow_policy_check}")
+    
     with sqlite3.connect('books.db') as conn:
         c = conn.cursor()
         c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,))
         user = c.fetchone()
     
-    if not user or not user[0]:  # Не согласен или новый пользователь
+    if not user or (not user[0] and not allow_policy_check):  # Не согласен и проверка политики не разрешена
+        logger.info(f"Пользователь {user_id} не согласен с политикой")
         return False
-    if user[1] and user[1] > int(time.time()):  # Пользователь забанен
+    if user and user[1] and user[1] > int(time.time()):  # Пользователь забанен
         await message.reply_text(f"Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\nПричина: {user[2]}")
+        logger.info(f"Пользователь {user_id} заблокирован до {user[1]}")
         return False
     return True
 
@@ -83,6 +86,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT agreed FROM users WHERE user_id = ?", (user_id,))
         agreed = c.fetchone()[0]
     
+    logger.info(f"Старт для пользователя {user_id}, agreed={agreed}")
     if not agreed:
         keyboard = [
             [InlineKeyboardButton("Согласен", callback_data='agree_policy'),
@@ -141,7 +145,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     logger.info(f"Обработка callback: {query.data} для пользователя {user_id}")
     
-    if not await check_user(update, context):
+    # Разрешаем проверку политики для agree_policy и refuse_policy
+    allow_policy = query.data in ['agree_policy', 'refuse_policy']
+    if not await check_user(update, context, allow_policy_check=allow_policy):
         return
     
     if query.data == 'search_genre':
@@ -199,8 +205,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = conn.cursor()
             c.execute("UPDATE users SET agreed = 1 WHERE user_id = ?", (user_id,))
             conn.commit()
+        logger.info(f"Пользователь {user_id} согласился с политикой")
         await query.message.reply_text("Спасибо за согласие! Теперь вы можете использовать бот.", reply_markup=main_menu(user_id))
     elif query.data == 'refuse_policy':
+        logger.info(f"Пользователь {user_id} отказался от политики")
         await query.message.reply_text("Вы отказались от политики. Без согласия использовать бот невозможно.", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Согласен", callback_data='agree_policy'),
              InlineKeyboardButton("Отказ", callback_data='refuse_policy')]
