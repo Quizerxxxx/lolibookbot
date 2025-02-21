@@ -1,54 +1,25 @@
 import sqlite3
 import random
 import aiohttp
-from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, time
 import os
+import json
 
 # Инициализация базы данных
 def init_db():
     conn = sqlite3.connect('books.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS books 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT, genres TEXT, cover_url TEXT)''')
+                 (id TEXT PRIMARY KEY, title TEXT, description TEXT, genres TEXT, cover_url TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_read 
-                 (user_id INTEGER, book_id INTEGER, rating INTEGER)''')
+                 (user_id INTEGER, book_id TEXT, rating INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_favorites 
-                 (user_id INTEGER, book_id INTEGER)''')
+                 (user_id INTEGER, book_id TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (user_id INTEGER PRIMARY KEY, username TEXT)''')
     conn.commit()
-    conn.close()
-
-# Парсинг книг с ЛитРес
-async def fetch_books():
-    conn = sqlite3.connect('books.db')
-    c = conn.cursor()
-    
-    async with aiohttp.ClientSession() as session:
-        url = "https://www.litres.ru/novie/"  # Страница новинок
-        async with session.get(url) as response:
-            if response.status != 200:
-                print(f"Ошибка: {response.status}")
-                return
-            html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            books = soup.select('.books-list-item')
-            for book in books[:50]:  # Ограничим 50 книгами для примера
-                title = book.select_one('.book-title').text.strip()
-                cover_url = book.select_one('.book-cover')['src']
-                description_elem = book.select_one('.annotation')
-                description = description_elem.text.strip() if description_elem else "Нет описания"
-                genres_elem = book.select_one('.genres')
-                genres = genres_elem.text.strip() if genres_elem else "Нет жанров"
-                
-                c.execute("INSERT OR IGNORE INTO books (title, description, genres, cover_url) VALUES (?, ?, ?, ?)",
-                          (title, description, genres, cover_url))
-            
-            conn.commit()
     conn.close()
 
 # Главное меню с кнопками
@@ -74,7 +45,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     
-    await update.message.reply_text("Добро пожаловать в бот для книг!", reply_markup=main_menu())
+    await update.message.reply_text("Добро пожаловать в бот для книг! Я использую Open Library для поиска книг по всему миру.", reply_markup=main_menu())
+
+# Поиск книги через Open Library API
+async def search_book_by_genre(genre):
+    async with aiohttp.ClientSession() as session:
+        url = f"https://openlibrary.org/subjects/{genre.lower().replace(' ', '_')}.json?limit=1&sort=random"
+        async with session.get(url) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+            if not data.get('works'):
+                return None
+            
+            work = data['works'][0]
+            book_id = work['key'].split('/')[-1]  # Например, "OL123W"
+            title = work.get('title', 'Нет названия')
+            
+            # Получаем детальную информацию
+            detail_url = f"https://openlibrary.org/works/{book_id}.json"
+            async with session.get(detail_url) as detail_response:
+                if detail_response.status != 200:
+                    return None
+                detail_data = await detail_response.json()
+                description = detail_data.get('description', 'Нет описания') if isinstance(detail_data.get('description'), str) else 'Нет описания'
+                genres = ','.join(work.get('subject', ['Нет жанров']))
+                cover_id = work.get('cover_id')
+                cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else "https://via.placeholder.com/150"
+                
+                return {'id': book_id, 'title': title, 'description': description, 'genres': genres, 'cover_url': cover_url}
+    return None
+
+# Кэширование книги в локальной базе
+def cache_book(book):
+    conn = sqlite3.connect('books.db')
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO books (id, title, description, genres, cover_url) VALUES (?, ?, ?, ?, ?)",
+              (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
+    conn.commit()
+    conn.close()
 
 # Обработка кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,12 +117,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = conn.cursor()
     
     if state == 'search_genre':
-        c.execute("SELECT * FROM books WHERE genres LIKE ? ORDER BY RANDOM() LIMIT 1", (f'%{text}%',))
-        book = c.fetchone()
+        book = await search_book_by_genre(text)
         if book:
+            cache_book(book)
             await update.message.reply_photo(
-                photo=book[4],
-                caption=f"**{book[1]}**\n\n{book[2]}\n\nЖанры: {book[3]}",
+                photo=book['cover_url'],
+                caption=f"**{book['title']}**\n\n{book['description']}\n\nЖанры: {book['genres']}",
                 reply_markup=main_menu()
             )
         else:
@@ -127,7 +136,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             await update.message.reply_text(f"Книга '{text}' добавлена в прочитанное.", reply_markup=main_menu())
         else:
-            await update.message.reply_text("Книга не найдена.", reply_markup=main_menu())
+            await update.message.reply_text("Книга не найдена в базе. Попробуй поискать её по жанру сначала.", reply_markup=main_menu())
     
     elif state == 'add_favorite':
         c.execute("SELECT id FROM books WHERE title LIKE ?", (f'%{text}%',))
@@ -137,7 +146,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             await update.message.reply_text(f"Книга '{text}' добавлена в избранное.", reply_markup=main_menu())
         else:
-            await update.message.reply_text("Книга не найдена.", reply_markup=main_menu())
+            await update.message.reply_text("Книга не найдена в базе. Попробуй поискать её по жанру сначала.", reply_markup=main_menu())
     
     elif state == 'rate_book':
         try:
@@ -209,24 +218,18 @@ async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
         
         if genres:
             random_genre = random.choice(genres.split(','))
-            c.execute("SELECT * FROM books WHERE genres LIKE ? AND id NOT IN (SELECT book_id FROM user_favorites WHERE user_id = ?) ORDER BY RANDOM() LIMIT 1",
-                      (f'%{random_genre}%', user_id))
-            book = c.fetchone()
-            
+            book = await search_book_by_genre(random_genre)
             if book:
+                cache_book(book)
                 await context.bot.send_photo(
                     chat_id=user_id,
-                    photo=book[4],
-                    caption=f"Ежедневная рекомендация:\n**{book[1]}**\n\n{book[2]}\n\nЖанры: {book[3]}"
+                    photo=book['cover_url'],
+                    caption=f"Ежедневная рекомендация:\n**{book['title']}**\n\n{book['description']}\n\nЖанры: {book['genres']}"
                 )
     conn.close()
 
 def main():
     init_db()
-    
-    # Запуск парсинга (асинхронно)
-    import asyncio
-    asyncio.run(fetch_books())
     
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAH0x9rsdU5Fv3aRJhlZ1zF_mdlSTFffHos')).build()
     
