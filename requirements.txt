@@ -4,3 +4,4 @@ xmltodict
 requests
 beautifulsoup4
 gitpython
+psycopg2-binary
