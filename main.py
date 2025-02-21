@@ -1,16 +1,13 @@
-import sqlite3
+import psycopg2
 import random
 import aiohttp
 import logging
 import os
-import git
-from git import Repo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, time, timedelta
 import asyncio
-import shutil
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -20,56 +17,27 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = 486000906
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
-GITHUB_REPO = "https://github.com/Quizerxxxx/lolibookbot.git"  # Замените на ваш репозиторий
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
-BRANCH = 'main'  # Основная ветка
+
+# Подключение к PostgreSQL (строка подключения из Render)
+DB_CONN_STRING = os.getenv('DB_CONN_STRING', 'postgresql://loli_db_user:UxaiJ1HL8xZp67mf1zzEikqFzvgH57Ch@dpg-cusbuba3esus73flt5qg-a/loli_db')
 
 # Инициализация базы данных
 def init_db():
-    if not os.path.exists('books.db'):
-        logger.info("Создаём новую базу данных")
-    conn = sqlite3.connect('books.db')
+    conn = psycopg2.connect(DB_CONN_STRING)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS books 
                  (id TEXT PRIMARY KEY, title TEXT, description TEXT, genres TEXT, cover_url TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_read 
-                 (user_id INTEGER, book_id TEXT, rating INTEGER, PRIMARY KEY (user_id, book_id))''')
+                 (user_id BIGINT, book_id TEXT, rating INTEGER, PRIMARY KEY (user_id, book_id))''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_favorites 
-                 (user_id INTEGER, book_id TEXT, PRIMARY KEY (user_id, book_id))''')
+                 (user_id BIGINT, book_id TEXT, PRIMARY KEY (user_id, book_id))''')
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, username TEXT, agreed INTEGER DEFAULT 0, banned_until INTEGER DEFAULT 0, ban_reason TEXT, requests INTEGER DEFAULT 0, last_request INTEGER DEFAULT 0)''')
+                 (user_id BIGINT PRIMARY KEY, username TEXT, agreed INTEGER DEFAULT 0, banned_until BIGINT DEFAULT 0, ban_reason TEXT, requests INTEGER DEFAULT 0, last_request BIGINT DEFAULT 0)''')
     c.execute('''CREATE TABLE IF NOT EXISTS search_history 
-                 (user_id INTEGER, query TEXT, timestamp INTEGER)''')
+                 (user_id BIGINT, query TEXT, timestamp BIGINT)''')
     conn.commit()
     conn.close()
-
-# Синхронизация базы с GitHub
-def sync_db_with_github(action="push"):
-    repo_dir = '.'
-    try:
-        repo = Repo(repo_dir)
-        origin = repo.remote('origin')  # Получаем удалённый репозиторий 'origin'
-        
-        if action == "pull":
-            logger.info("Загружаем базу данных из GitHub")
-            origin.pull(BRANCH)  # Явно указываем ветку
-            if os.path.exists('books.db') and os.path.getsize('books.db') > 0:
-                logger.info("База данных успешно загружена")
-            else:
-                logger.info("База данных пуста или отсутствует, инициализируем новую")
-                init_db()
-        elif action == "push":
-            logger.info("Синхронизируем базу данных с GitHub")
-            repo.git.add('books.db')
-            if repo.is_dirty(untracked_files=True):
-                repo.git.commit(m=f"Update database {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                repo.git.push('origin', BRANCH)  # Явно указываем ветку
-            else:
-                logger.info("Нет изменений для коммита")
-    except git.exc.GitCommandError as e:
-        logger.error(f"Ошибка Git: {e}")
-    except Exception as e:
-        logger.error(f"Ошибка синхронизации с GitHub: {e}")
+    logger.info("База данных PostgreSQL инициализирована")
 
 # Главное меню
 def main_menu(user_id):
@@ -94,24 +62,28 @@ def rating_to_stars(rating):
 
 # Проверка лимита запросов
 def check_rate_limit(user_id):
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT requests, last_request FROM users WHERE user_id = ?", (user_id,))
-        user = c.fetchone()
-        current_time = int(time.time())
-        
-        if not user or current_time - user[1] > REQUEST_WINDOW:
-            c.execute("UPDATE users SET requests = 1, last_request = ? WHERE user_id = ?", (current_time, user_id))
-            conn.commit()
-            return True
-        
-        requests, last_request = user
-        if requests < REQUEST_LIMIT:
-            c.execute("UPDATE users SET requests = requests + 1 WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return True
-        logger.warning(f"Пользователь {user_id} превысил лимит запросов")
-        return False
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("SELECT requests, last_request FROM users WHERE user_id = %s", (user_id,))
+    user = c.fetchone()
+    current_time = int(time.time())
+    
+    if not user or current_time - user[1] > REQUEST_WINDOW:
+        c.execute("INSERT INTO users (user_id, requests, last_request) VALUES (%s, 1, %s) ON CONFLICT (user_id) DO UPDATE SET requests = 1, last_request = %s", 
+                  (user_id, current_time, current_time))
+        conn.commit()
+        conn.close()
+        return True
+    
+    requests, last_request = user
+    if requests < REQUEST_LIMIT:
+        c.execute("UPDATE users SET requests = requests + 1 WHERE user_id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        return True
+    logger.warning(f"Пользователь {user_id} превысил лимит запросов")
+    conn.close()
+    return False
 
 # Проверка согласия и бана
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,10 +98,11 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("🚫 Вы превысили лимит запросов (60 в минуту). Подождите немного!", parse_mode=ParseMode.MARKDOWN)
         return False
     
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,))
-        user = c.fetchone()
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = %s", (user_id,))
+    user = c.fetchone()
+    conn.close()
     
     if not user:  # Новый пользователь
         return True
@@ -145,11 +118,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     username = update.message.from_user.username
     
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-        c.execute("SELECT agreed FROM users WHERE user_id = ?", (user_id,))
-        agreed = c.fetchone()[0]
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING", (user_id, username))
+    c.execute("SELECT agreed FROM users WHERE user_id = %s", (user_id,))
+    agreed = c.fetchone()[0]
+    conn.commit()
+    conn.close()
     
     if not agreed:
         keyboard = [
@@ -198,37 +173,30 @@ async def search_book_by_title_or_genre(query, is_genre=False, author=None):
 
 # Кэширование книги
 def cache_book(book):
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO books (id, title, description, genres, cover_url) VALUES (?, ?, ?, ?, ?)",
-                  (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
-        conn.commit()
-    sync_db_with_github("push")  # Синхронизация после изменения
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("INSERT INTO books (id, title, description, genres, cover_url) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+              (book['id'], book['title'], book['description'], book['genres'], book['cover_url']))
+    conn.commit()
+    conn.close()
 
-# Резервное копирование базы
+# Резервное копирование базы (опционально, для PostgreSQL не требуется локально)
 async def backup_database(context: ContextTypes.DEFAULT_TYPE):
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    shutil.copy('books.db', f'books_backup_{timestamp}.db')
-    logger.info(f"Создан бэкап базы: books_backup_{timestamp}.db")
-    sync_db_with_github("push")  # Синхронизация бэкапа
+    logger.info("Бэкап для PostgreSQL не требуется, данные сохраняются автоматически")
 
 # Сброс базы данных
 def reset_database(user_id=None):
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        if user_id:
-            c.execute("DELETE FROM user_read WHERE user_id = ?", (user_id,))
-            c.execute("DELETE FROM user_favorites WHERE user_id = ?", (user_id,))
-            c.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-            c.execute("DELETE FROM search_history WHERE user_id = ?", (user_id,))
-        else:
-            c.execute("DELETE FROM books")
-            c.execute("DELETE FROM user_read")
-            c.execute("DELETE FROM user_favorites")
-            c.execute("DELETE FROM users")
-            c.execute("DELETE FROM search_history")
-        conn.commit()
-    sync_db_with_github("push")  # Синхронизация после сброса
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    if user_id:
+        c.execute("DELETE FROM user_read WHERE user_id = %s", (user_id,))
+        c.execute("DELETE FROM user_favorites WHERE user_id = %s", (user_id,))
+        c.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+        c.execute("DELETE FROM search_history WHERE user_id = %s", (user_id,))
+    else:
+        c.execute("TRUNCATE TABLE books, user_read, user_favorites, users, search_history RESTART IDENTITY")
+    conn.commit()
+    conn.close()
 
 # Обработка кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,16 +207,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data in ['agree_policy', 'refuse_policy']:
         if query.data == 'agree_policy':
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("UPDATE users SET agreed = 1 WHERE user_id = ?", (user_id,))
-                conn.commit()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("UPDATE users SET agreed = 1 WHERE user_id = %s", (user_id,))
+            conn.commit()
+            conn.close()
             logger.info(f"Пользователь {user_id} согласился с политикой")
             await query.message.reply_text("✅ *Спасибо за согласие!*\nТеперь вы можете использовать бот.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'refuse_policy':
             logger.info(f"Пользователь {user_id} отказался от политики")
             await query.message.reply_text("❌ *Вы отказались от политики.*\nИспользование бота невозможно.")
-        sync_db_with_github("push")  # Синхронизация после изменения
         return
 
     if not await check_user(update, context):
@@ -283,21 +251,21 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif query.data == 'add_found_to_read':
             book = context.user_data.get('last_found_book')
             if book:
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book['id']))
+                conn.commit()
+                conn.close()
                 await query.message.reply_text(f"📖 Книга *{book['title']}* добавлена в прочитанное.\nПопробуйте */search*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                sync_db_with_github("push")
         elif query.data == 'add_found_to_favorite':
             book = context.user_data.get('last_found_book')
             if book:
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book['id']))
+                conn.commit()
+                conn.close()
                 await query.message.reply_text(f"❤️ Книга *{book['title']}* добавлена в избранное.\nПопробуйте */search*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                sync_db_with_github("push")
         elif query.data.startswith('list_action_'):
             action, list_type = query.data.split('_')[2], query.data.split('_')[3]
             context.user_data['list_action'] = action
@@ -307,14 +275,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif query.data.startswith('rate_'):
             _, book_id, rating = query.data.split('_')
             rating = int(rating)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("UPDATE user_read SET rating = ? WHERE user_id = ? AND book_id = ?", (rating, user_id, book_id))
-                if c.rowcount == 0:
-                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
-                conn.commit()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("UPDATE user_read SET rating = %s WHERE user_id = %s AND book_id = %s", (rating, user_id, book_id))
+            if c.rowcount == 0:
+                c.execute("INSERT INTO user_read (user_id, book_id, rating) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (user_id, book_id, rating))
+            conn.commit()
+            conn.close()
             await query.message.reply_text(f"⭐ Оценка {rating}★ сохранена.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-            sync_db_with_github("push")
         elif query.data == 'main_menu':
             await query.message.reply_text("🔙 *Возвращаемся в главное меню:*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'admin_panel':
@@ -341,38 +309,29 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("✅ Введите ID пользователя для разблокировки:", parse_mode=ParseMode.MARKDOWN)
             context.user_data['state'] = 'admin_unban_id'
         elif query.data == 'admin_stats':
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT COUNT(*) FROM users")
-                user_count = c.fetchone()[0]
-                c.execute("SELECT COUNT(*) FROM books")
-                book_count = c.fetchone()[0]
-                c.execute("SELECT AVG(rating) FROM user_read WHERE rating IS NOT NULL")
-                avg_rating = c.fetchone()[0]
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM users")
+            user_count = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM books")
+            book_count = c.fetchone()[0]
+            c.execute("SELECT AVG(rating) FROM user_read WHERE rating IS NOT NULL")
+            avg_rating = c.fetchone()[0]
+            conn.close()
             avg_rating = f"{avg_rating:.2f}★" if avg_rating else "Нет оценок"
             await query.message.reply_text(f"📊 *Статистика:*\n- Пользователей: {user_count}\n- Книг в базе: {book_count}\n- Средний рейтинг: {avg_rating}", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'admin_logs':
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT user_id FROM users ORDER BY user_id LIMIT 5")
-                users = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users ORDER BY user_id LIMIT 5")
+            users = c.fetchall()
+            conn.close()
             log_text = "📜 *Последние действия пользователей:*\n"
             for uid in users:
                 log_text += f"- Пользователь {uid[0]}\n"
             await query.message.reply_text(log_text, reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'admin_restore':
-            backups = [f for f in os.listdir() if f.startswith('books_backup_')]
-            if not backups:
-                await query.message.reply_text("🔄 *Нет доступных бэкапов.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-            else:
-                keyboard = [[InlineKeyboardButton(f"📂 {b}", callback_data=f'restore_{b}')] for b in backups[:5]]
-                keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data='main_menu')])
-                await query.message.reply_text("🔄 *Выберите бэкап для восстановления:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-        elif query.data.startswith('restore_'):
-            backup_file = query.data.split('_', 1)[1]
-            shutil.copy(backup_file, 'books.db')
-            await query.message.reply_text(f"🔄 *База данных восстановлена из {backup_file}.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-            sync_db_with_github("push")
+            await query.message.reply_text("🔄 *Восстановление бэкапа не поддерживается для PostgreSQL напрямую. Используйте дамп базы через Render.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'admin_reset_all':
             reset_database()
             await query.message.reply_text("🗑️ *База данных полностью сброшена.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
@@ -393,10 +352,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("📝 Укажи номер книги для редактирования:", parse_mode=ParseMode.MARKDOWN)
             context.user_data['state'] = 'edit_book_select'
         elif query.data == 'export_read':
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT b.title, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT b.title, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = %s", (user_id,))
+            books = c.fetchall()
+            conn.close()
             if books:
                 export_text = "📖 *Ваши прочитанные книги:*\n"
                 for i, (title, rating) in enumerate(books, 1):
@@ -408,10 +368,11 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("📖 *Список прочитанного пуст.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         elif query.data == 'export_favorites':
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = %s", (user_id,))
+            books = c.fetchall()
+            conn.close()
             if books:
                 export_text = "⭐ *Ваши избранные книги:*\n"
                 for i, (title,) in enumerate(books, 1):
@@ -444,10 +405,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if book:
                 cache_book(book)
                 context.user_data['last_found_book'] = book
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO search_history (user_id, query, timestamp) VALUES (?, ?, ?)", (user_id, text, int(time.time())))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                conn.commit()
+                conn.close()
                 keyboard = [
                     [InlineKeyboardButton("📖 Добавить в прочитанное", callback_data='add_found_to_read'),
                      InlineKeyboardButton("❤️ Добавить в избранное", callback_data='add_found_to_favorite')],
@@ -470,10 +432,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if book:
                 cache_book(book)
                 context.user_data['last_found_book'] = book
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO search_history (user_id, query, timestamp) VALUES (?, ?, ?)", (user_id, text, int(time.time())))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                conn.commit()
+                conn.close()
                 keyboard = [
                     [InlineKeyboardButton("📖 Добавить в прочитанное", callback_data='add_found_to_read'),
                      InlineKeyboardButton("❤️ Добавить в избранное", callback_data='add_found_to_favorite')],
@@ -499,10 +462,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if book:
                 cache_book(book)
                 context.user_data['last_found_book'] = book
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO search_history (user_id, query, timestamp) VALUES (?, ?, ?)", (user_id, text, int(time.time())))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("INSERT INTO search_history (user_id, query, timestamp) VALUES (%s, %s, %s)", (user_id, text, int(time.time())))
+                conn.commit()
+                conn.close()
                 keyboard = [
                     [InlineKeyboardButton("📖 Добавить в прочитанное", callback_data='add_found_to_read'),
                      InlineKeyboardButton("❤️ Добавить в избранное", callback_data='add_found_to_favorite')],
@@ -521,55 +485,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif state == 'add_read':
             msg = await update.message.reply_text("⏳ *Добавление книги...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM books WHERE title LIKE ?", (f'%{text}%',))
-                book = c.fetchone()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT id FROM books WHERE title ILIKE %s", (f'%{text}%',))
+            book = c.fetchone()
+            if book:
+                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book[0]))
+                conn.commit()
+                await update.message.reply_text(f"📖 Книга *{text}* добавлена в прочитанное.\nПопробуйте */read*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            else:
+                book = await search_book_by_title_or_genre(text)
                 if book:
-                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
+                    cache_book(book)
+                    c.execute("INSERT INTO user_read (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book['id']))
                     conn.commit()
                     await update.message.reply_text(f"📖 Книга *{text}* добавлена в прочитанное.\nПопробуйте */read*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                    sync_db_with_github("push")
                 else:
-                    book = await search_book_by_title_or_genre(text)
-                    if book:
-                        cache_book(book)
-                        c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
-                        conn.commit()
-                        await update.message.reply_text(f"📖 Книга *{text}* добавлена в прочитанное.\nПопробуйте */read*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                        sync_db_with_github("push")
-                    else:
-                        context.user_data['manual_title'] = text
-                        context.user_data['manual_list'] = 'read'
-                        await update.message.reply_text("📚 *Книга не найдена.*\nУкажи описание:", parse_mode=ParseMode.MARKDOWN)
-                        context.user_data['state'] = 'manual_description'
+                    context.user_data['manual_title'] = text
+                    context.user_data['manual_list'] = 'read'
+                    await update.message.reply_text("📚 *Книга не найдена.*\nУкажи описание:", parse_mode=ParseMode.MARKDOWN)
+                    context.user_data['state'] = 'manual_description'
+            conn.close()
             await msg.delete()
         
         elif state == 'add_favorite':
             msg = await update.message.reply_text("⏳ *Добавление книги...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT id FROM books WHERE title LIKE ?", (f'%{text}%',))
-                book = c.fetchone()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT id FROM books WHERE title ILIKE %s", (f'%{text}%',))
+            book = c.fetchone()
+            if book:
+                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book[0]))
+                conn.commit()
+                await update.message.reply_text(f"❤️ Книга *{text}* добавлена в избранное.\nПопробуйте */favorites*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
+            else:
+                book = await search_book_by_title_or_genre(text)
                 if book:
-                    c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
+                    cache_book(book)
+                    c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book['id']))
                     conn.commit()
                     await update.message.reply_text(f"❤️ Книга *{text}* добавлена в избранное.\nПопробуйте */favorites*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                    sync_db_with_github("push")
                 else:
-                    book = await search_book_by_title_or_genre(text)
-                    if book:
-                        cache_book(book)
-                        c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
-                        conn.commit()
-                        await update.message.reply_text(f"❤️ Книга *{text}* добавлена в избранное.\nПопробуйте */favorites*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                        sync_db_with_github("push")
-                    else:
-                        context.user_data['manual_title'] = text
-                        context.user_data['manual_list'] = 'favorite'
-                        await update.message.reply_text("📚 *Книга не найдена.*\nУкажи описание:", parse_mode=ParseMode.MARKDOWN)
-                        context.user_data['state'] = 'manual_description'
+                    context.user_data['manual_title'] = text
+                    context.user_data['manual_list'] = 'favorite'
+                    await update.message.reply_text("📚 *Книга не найдена.*\nУкажи описание:", parse_mode=ParseMode.MARKDOWN)
+                    context.user_data['state'] = 'manual_description'
+            conn.close()
             await msg.delete()
         
         elif state == 'manual_description':
@@ -595,30 +557,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             book_id = f"manual_{user_id}_{int(time.time())}"
             book = {'id': book_id, 'title': title, 'description': description, 'genres': 'Не указаны', 'cover_url': cover_url}
             cache_book(book)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                if list_type == 'read':
-                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
-                else:
-                    c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
-                conn.commit()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            if list_type == 'read':
+                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book_id))
+            else:
+                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book_id))
+            conn.commit()
+            conn.close()
             await update.message.reply_text(f"📚 Книга *{title}* добавлена в {list_type == 'read' and 'прочитанное' or 'избранное'}.\nПопробуйте */{'read' if list_type == 'read' else 'favorites'}*!", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await msg.delete()
             context.user_data['state'] = None
-            sync_db_with_github("push")
         
         elif state == 'list_action_select':
             msg = await update.message.reply_text("⏳ *Обработка...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
             action = context.user_data['list_action']
             list_type = context.user_data['list_type']
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                if list_type == 'read':
-                    c.execute("SELECT b.id, b.title FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
-                else:
-                    c.execute("SELECT b.id, b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            if list_type == 'read':
+                c.execute("SELECT b.id, b.title FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = %s", (user_id,))
+            else:
+                c.execute("SELECT b.id, b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = %s", (user_id,))
+            books = c.fetchall()
+            conn.close()
             
             try:
                 index = int(text) - 1
@@ -633,39 +596,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await msg.delete()
                     return
             
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
             if action == 'rate':
                 keyboard = [[InlineKeyboardButton(f"{i}★", callback_data=f'rate_{book_id}_{i}') for i in range(1, 6)]]
                 await update.message.reply_text("⭐ *Выбери оценку:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
             elif action == 'delete':
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    if list_type == 'read':
-                        c.execute("DELETE FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
-                    else:
-                        c.execute("DELETE FROM user_favorites WHERE user_id = ? AND book_id = ?", (user_id, book_id))
-                    conn.commit()
+                if list_type == 'read':
+                    c.execute("DELETE FROM user_read WHERE user_id = %s AND book_id = %s", (user_id, book_id))
+                else:
+                    c.execute("DELETE FROM user_favorites WHERE user_id = %s AND book_id = %s", (user_id, book_id))
+                conn.commit()
                 await update.message.reply_text(f"🗑️ Книга удалена из {list_type == 'read' and 'прочитанного' or 'избранного'}.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                sync_db_with_github("push")
             elif action == 'move':
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    if list_type == 'read':
-                        c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
-                    else:
-                        c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
-                    conn.commit()
+                if list_type == 'read':
+                    c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book_id))
+                else:
+                    c.execute("INSERT INTO user_read (user_id, book_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, book_id))
+                conn.commit()
                 await update.message.reply_text(f"➡️ Книга добавлена в {list_type == 'read' and 'избранное' or 'прочитанное'}.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
-                sync_db_with_github("push")
+            conn.close()
             await msg.delete()
             context.user_data['state'] = None
         
         elif state == 'select_book_read':
             msg = await update.message.reply_text("⏳ *Поиск книги...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = %s", (user_id,))
+            books = c.fetchall()
+            conn.close()
             
             try:
                 index = int(text) - 1
@@ -694,17 +655,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif state == 'select_book_favorite':
             msg = await update.message.reply_text("⏳ *Поиск книги...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT b.id, b.title, b.description, b.genres, b.cover_url FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = %s", (user_id,))
+            books = c.fetchall()
+            conn.close()
             
             try:
                 index = int(text) - 1
                 if 0 <= index < len(books):
                     book_id, title, description, genres, cover_url = books[index]
-                    c.execute("SELECT rating FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
+                    conn = psycopg2.connect(DB_CONN_STRING)
+                    c = conn.cursor()
+                    c.execute("SELECT rating FROM user_read WHERE user_id = %s AND book_id = %s", (user_id, book_id))
                     rating = c.fetchone()
+                    conn.close()
                     rating = rating[0] if rating else None
                     keyboard = [
                         [InlineKeyboardButton("🗑️ Удалить из избранного", callback_data='list_action_delete_favorite'),
@@ -729,10 +694,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif state == 'edit_book_select':
             msg = await update.message.reply_text("⏳ *Поиск книги...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT id, title FROM books WHERE id LIKE 'manual_%'", ())  # Только вручную добавленные книги
-                books = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT id, title FROM books WHERE id LIKE 'manual_%'", ())
+            books = c.fetchall()
+            conn.close()
             
             try:
                 index = int(text) - 1
@@ -766,25 +732,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.delete()
                 return
             
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                if new_description:
-                    c.execute("UPDATE books SET description = ? WHERE id = ?", (new_description, book_id))
-                if new_cover_url:
-                    c.execute("UPDATE books SET cover_url = ? WHERE id = ?", (new_cover_url, book_id))
-                conn.commit()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            if new_description:
+                c.execute("UPDATE books SET description = %s WHERE id = %s", (new_description, book_id))
+            if new_cover_url:
+                c.execute("UPDATE books SET cover_url = %s WHERE id = %s", (new_cover_url, book_id))
+            conn.commit()
+            conn.close()
             await update.message.reply_text("📝 *Книга обновлена!*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await msg.delete()
             context.user_data['state'] = None
-            sync_db_with_github("push")
         
         elif state == 'admin_broadcast_message' and user_id == ADMIN_ID:
             msg = await update.message.reply_text("⏳ *Отправка рассылки...*", parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(1)
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < ?)", (int(time.time()),))
-                users = c.fetchall()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time.time()),))
+            users = c.fetchall()
+            conn.close()
             for uid in users:
                 try:
                     await context.bot.send_message(chat_id=uid[0], text=text, parse_mode=ParseMode.MARKDOWN)
@@ -817,26 +784,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             duration = context.user_data['ban_duration']
             reason = text
             ban_until = int(time.time()) + duration * 86400
-            with sqlite3.connect('books.db') as conn:
-                c = conn.cursor()
-                c.execute("UPDATE users SET banned_until = ?, ban_reason = ? WHERE user_id = ?", (ban_until, reason, ban_user_id))
-                conn.commit()
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("UPDATE users SET banned_until = %s, ban_reason = %s WHERE user_id = %s", (ban_until, reason, ban_user_id))
+            conn.commit()
+            conn.close()
             await update.message.reply_text(f"🚫 Пользователь {ban_user_id} заблокирован до {datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')} по причине: *{reason}*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
             await context.bot.send_message(chat_id=ban_user_id, text=f"🚫 *Вы заблокированы до {datetime.fromtimestamp(ban_until).strftime('%Y-%m-%d %H:%M:%S')}*\n*Причина:* {reason}", parse_mode=ParseMode.MARKDOWN)
             context.user_data['state'] = None
-            sync_db_with_github("push")
         
         elif state == 'admin_unban_id' and user_id == ADMIN_ID:
             try:
                 unban_user_id = int(text)
-                with sqlite3.connect('books.db') as conn:
-                    c = conn.cursor()
-                    c.execute("UPDATE users SET banned_until = 0, ban_reason = NULL WHERE user_id = ?", (unban_user_id,))
-                    conn.commit()
+                conn = psycopg2.connect(DB_CONN_STRING)
+                c = conn.cursor()
+                c.execute("UPDATE users SET banned_until = 0, ban_reason = NULL WHERE user_id = %s", (unban_user_id,))
+                conn.commit()
+                conn.close()
                 await update.message.reply_text(f"✅ Пользователь {unban_user_id} разблокирован.", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
                 await context.bot.send_message(chat_id=unban_user_id, text="✅ *Вы были разблокированы!*", parse_mode=ParseMode.MARKDOWN)
                 context.user_data['state'] = None
-                sync_db_with_github("push")
             except ValueError:
                 await update.message.reply_text("❌ *Введите корректный ID пользователя.*", reply_markup=main_menu(user_id), parse_mode=ParseMode.MARKDOWN)
         
@@ -870,10 +837,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_read(query, context, page):
     user_id = query.from_user.id if query.from_user else query.message.from_user.id
     logger.info(f"Показ списка прочитанного для {user_id}, страница {page}")
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT b.id, b.title, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = ?", (user_id,))
-        books = c.fetchall()
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("SELECT b.id, b.title, ur.rating FROM user_read ur JOIN books b ON ur.book_id = b.id WHERE ur.user_id = %s", (user_id,))
+    books = c.fetchall()
+    conn.close()
     
     items_per_page = 10
     total_pages = (len(books) + items_per_page - 1) // items_per_page
@@ -903,10 +871,11 @@ async def show_read(query, context, page):
 async def show_favorites(query, context, page):
     user_id = query.from_user.id if query.from_user else query.message.from_user.id
     logger.info(f"Показ списка избранного для {user_id}, страница {page}")
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT b.id, b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = ?", (user_id,))
-        books = c.fetchall()
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("SELECT b.id, b.title FROM user_favorites uf JOIN books b ON uf.book_id = b.id WHERE uf.user_id = %s", (user_id,))
+    books = c.fetchall()
+    conn.close()
     
     items_per_page = 10
     total_pages = (len(books) + items_per_page - 1) // items_per_page
@@ -916,8 +885,11 @@ async def show_favorites(query, context, page):
     if books:
         list_text = f"⭐ *Список избранного (страница {page}/{total_pages}):*\n"
         for i, (book_id, title) in enumerate(books[start_idx:end_idx], start_idx + 1):
-            c.execute("SELECT rating FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
+            conn = psycopg2.connect(DB_CONN_STRING)
+            c = conn.cursor()
+            c.execute("SELECT rating FROM user_read WHERE user_id = %s AND book_id = %s", (user_id, book_id))
             rating = c.fetchone()
+            conn.close()
             rating = rating[0] if rating else None
             list_text += f"{i}. {title} - {rating_to_stars(rating)}\n"
         keyboard = [
@@ -938,17 +910,19 @@ async def show_favorites(query, context, page):
 
 # Ежедневная рекомендация (с учётом часового пояса UTC+3)
 async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect('books.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < ?)", (int(time.time()),))
-        users = c.fetchall()
+    conn = psycopg2.connect(DB_CONN_STRING)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE agreed = 1 AND (banned_until IS NULL OR banned_until < %s)", (int(time.time()),))
+    users = c.fetchall()
+    conn.close()
     
     for user_id in users:
         user_id = user_id[0]
-        with sqlite3.connect('books.db') as conn:
-            c = conn.cursor()
-            c.execute("SELECT genres FROM books b JOIN user_favorites uf ON b.id = uf.book_id WHERE uf.user_id = ?", (user_id,))
-            genres = [g[0] for g in c.fetchall()]
+        conn = psycopg2.connect(DB_CONN_STRING)
+        c = conn.cursor()
+        c.execute("SELECT genres FROM books b JOIN user_favorites uf ON b.id = uf.book_id WHERE uf.user_id = %s", (user_id,))
+        genres = [g[0] for g in c.fetchall()]
+        conn.close()
         
         if genres:
             random_genre = random.choice(genres.split(','))
@@ -963,21 +937,6 @@ async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 def main():
-    # Инициализация Git репозитория
-    if not os.path.exists('.git'):
-        logger.info("Инициализация Git репозитория")
-        repo = Repo.init()
-        repo.git.checkout(b=BRANCH)  # Создаём ветку main
-        with open('README.md', 'w') as f:
-            f.write("# Book Bot Database\nThis repository stores the SQLite database for the Telegram Book Bot.")
-        repo.git.add('README.md')
-        repo.git.commit(m="Initial commit")
-        repo.create_remote('origin', GITHUB_REPO.replace('https://', f'https://{GITHUB_TOKEN}@'))
-        repo.git.push('--set-upstream', 'origin', BRANCH)
-    
-    # Загрузка базы данных при запуске
-    sync_db_with_github("pull")
-    
     init_db()
     application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAH0x9rsdU5Fv3aRJhlZ1zF_mdlSTFffHos')).build()
     
