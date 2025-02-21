@@ -34,7 +34,7 @@ def init_db():
 def main_menu(user_id):
     keyboard = [
         [InlineKeyboardButton("Поиск по жанру", callback_data='search_genre'),
-         InlineKeyboardButton("Поиск книги", callback_data='search_title')],
+         InlineKeyboardButton("Поиск книги", callback_data='search_title')],  # Добавлена кнопка "Поиск книги"
         [InlineKeyboardButton("Добавить в прочитанное", callback_data='add_read'),
          InlineKeyboardButton("Добавить в избранное", callback_data='add_favorite')],
         [InlineKeyboardButton("Мои прочитанные", callback_data='show_read'),
@@ -52,7 +52,7 @@ def rating_to_stars(rating):
 
 # Проверка согласия и бана
 async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     with sqlite3.connect('books.db') as conn:
         c = conn.cursor()
         c.execute("SELECT agreed, banned_until, ban_reason FROM users WHERE user_id = ?", (user_id,))
@@ -61,7 +61,7 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not user[0]:  # Не согласен или новый пользователь
         return False
     if user[1] and user[1] > int(time.time()):  # Пользователь забанен
-        await update.message.reply_text(f"Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\nПричина: {user[2]}")
+        await update.effective_message.reply_text(f"Вы заблокированы до {datetime.fromtimestamp(user[1]).strftime('%Y-%m-%d %H:%M:%S')}.\nПричина: {user[2]}")
         return False
     return True
 
@@ -158,7 +158,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if book:
             with sqlite3.connect('books.db') as conn:
                 c = conn.cursor()
-                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
+                c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                 conn.commit()
             await query.message.reply_text(f"Книга '{book['title']}' добавлена в прочитанное.", reply_markup=main_menu(user_id))
     elif query.data == 'add_found_to_favorite':
@@ -166,7 +166,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if book:
             with sqlite3.connect('books.db') as conn:
                 c = conn.cursor()
-                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
+                c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                 conn.commit()
             await query.message.reply_text(f"Книга '{book['title']}' добавлена в избранное.", reply_markup=main_menu(user_id))
     elif query.data.startswith('list_action_'):
@@ -181,7 +181,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with sqlite3.connect('books.db') as conn:
             c = conn.cursor()
             c.execute("UPDATE user_read SET rating = ? WHERE user_id = ? AND book_id = ?", (rating, user_id, book_id))
-            if c.rowcount == 0:
+            if c.rowcount == 0:  # Если книга не в прочитанных, добавляем
                 c.execute("INSERT INTO user_read (user_id, book_id, rating) VALUES (?, ?, ?)", (user_id, book_id, rating))
             conn.commit()
         await query.message.reply_text(f"Оценка {rating}★ сохранена.", reply_markup=main_menu(user_id))
@@ -282,14 +282,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("SELECT id FROM books WHERE title LIKE ?", (f'%{text}%',))
             book = c.fetchone()
             if book:
-                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
+                c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
                 conn.commit()
                 await update.message.reply_text(f"Книга '{text}' добавлена в прочитанное.", reply_markup=main_menu(user_id))
             else:
                 book = await search_book_by_title_or_genre(text)
                 if book:
                     cache_book(book)
-                    c.execute("INSERT INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
+                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                     conn.commit()
                     await update.message.reply_text(f"Книга '{text}' добавлена в прочитанное.", reply_markup=main_menu(user_id))
                 else:
@@ -307,14 +307,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c.execute("SELECT id FROM books WHERE title LIKE ?", (f'%{text}%',))
             book = c.fetchone()
             if book:
-                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
+                c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book[0]))
                 conn.commit()
                 await update.message.reply_text(f"Книга '{text}' добавлена в избранное.", reply_markup=main_menu(user_id))
             else:
                 book = await search_book_by_title_or_genre(text)
                 if book:
                     cache_book(book)
-                    c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
+                    c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book['id']))
                     conn.commit()
                     await update.message.reply_text(f"Книга '{text}' добавлена в избранное.", reply_markup=main_menu(user_id))
                 else:
@@ -350,9 +350,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with sqlite3.connect('books.db') as conn:
             c = conn.cursor()
             if list_type == 'read':
-                c.execute("INSERT INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
+                c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
             else:
-                c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
+                c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
             conn.commit()
         await update.message.reply_text(f"Книга '{title}' добавлена в {list_type == 'read' and 'прочитанное' or 'избранное'}.", reply_markup=main_menu(user_id))
         await msg.delete()
@@ -401,10 +401,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c = conn.cursor()
                 if list_type == 'read':
                     c.execute("DELETE FROM user_read WHERE user_id = ? AND book_id = ?", (user_id, book_id))
-                    c.execute("INSERT INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
+                    c.execute("INSERT OR IGNORE INTO user_favorites (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
                 else:
                     c.execute("DELETE FROM user_favorites WHERE user_id = ? AND book_id = ?", (user_id, book_id))
-                    c.execute("INSERT INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
+                    c.execute("INSERT OR IGNORE INTO user_read (user_id, book_id) VALUES (?, ?)", (user_id, book_id))
                 conn.commit()
             await update.message.reply_text(f"Книга перемещена в {list_type == 'read' and 'избранное' or 'прочитанное'}.", reply_markup=main_menu(user_id))
         await msg.delete()
@@ -541,7 +541,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, handle_message))
     
     # Установка времени для Москвы (UTC+3)
-    moscow_time = time(hour=9, tzinfo=tzoffset(None, 10800))  # 9 утра по Москве
+    moscow_time = time(hour=9, tzinfo=tzoffset(10800))  # 9 утра по Москве, убрано None
     application.job_queue.run_daily(daily_recommendation, moscow_time)
     
     application.run_polling()
