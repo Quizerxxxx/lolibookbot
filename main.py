@@ -4,6 +4,7 @@ import aiohttp
 import logging
 import os
 import git
+from git import Repo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = 486000906
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
-GITHUB_REPO = "https://github.com/Quizerxxxx/LoliBookDB.git"  # Замените на ваш репозиторий
+GITHUB_REPO = "https://github.com/Quizerxxxx/lolibookbot.git"  # Замените на ваш репозиторий
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
 BRANCH = 'main'  # Основная ветка
 
@@ -46,11 +47,11 @@ def init_db():
 def sync_db_with_github(action="push"):
     repo_dir = '.'
     try:
-        repo = git.Repo(repo_dir)
+        repo = Repo(repo_dir)
+        origin = repo.remote('origin')  # Получаем удалённый репозиторий 'origin'
         
         if action == "pull":
             logger.info("Загружаем базу данных из GitHub")
-            origin = repo.remotes.origin
             origin.pull(BRANCH)  # Явно указываем ветку
             if os.path.exists('books.db') and os.path.getsize('books.db') > 0:
                 logger.info("База данных успешно загружена")
@@ -60,11 +61,13 @@ def sync_db_with_github(action="push"):
         elif action == "push":
             logger.info("Синхронизируем базу данных с GitHub")
             repo.git.add('books.db')
-            if repo.is_dirty():
+            if repo.is_dirty(untracked_files=True):
                 repo.git.commit(m=f"Update database {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 repo.git.push('origin', BRANCH)  # Явно указываем ветку
             else:
                 logger.info("Нет изменений для коммита")
+    except git.exc.GitCommandError as e:
+        logger.error(f"Ошибка Git: {e}")
     except Exception as e:
         logger.error(f"Ошибка синхронизации с GitHub: {e}")
 
@@ -963,13 +966,13 @@ def main():
     # Инициализация Git репозитория
     if not os.path.exists('.git'):
         logger.info("Инициализация Git репозитория")
-        repo = git.Repo.init()
+        repo = Repo.init()
         repo.git.checkout(b=BRANCH)  # Создаём ветку main
         with open('README.md', 'w') as f:
             f.write("# Book Bot Database\nThis repository stores the SQLite database for the Telegram Book Bot.")
         repo.git.add('README.md')
         repo.git.commit(m="Initial commit")
-        repo.create_remote('origin', GITHUB_REPO)
+        repo.create_remote('origin', GITHUB_REPO.replace('https://', f'https://{GITHUB_TOKEN}@'))
         repo.git.push('--set-upstream', 'origin', BRANCH)
     
     # Загрузка базы данных при запуске
