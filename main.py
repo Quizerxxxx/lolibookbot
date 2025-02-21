@@ -20,7 +20,7 @@ ADMIN_ID = 486000906
 REQUEST_LIMIT = 60  # Лимит запросов в минуту на пользователя
 REQUEST_WINDOW = 60  # Окно в секундах
 GITHUB_REPO = "https://github.com/Quizerxxxx/LoliBookDB.git"  # Замените на ваш репозиторий
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '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')  # Добавьте токен в переменные окружения Render
 BRANCH = 'main'  # Основная ветка
 
 # Инициализация базы данных
