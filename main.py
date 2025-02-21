@@ -938,7 +938,7 @@ async def daily_recommendation(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAH0x9rsdU5Fv3aRJhlZ1zF_mdlSTFffHos')).build()
+    application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN', '8173510242:AAHTX8aDvKyzbLdDeqfA2zNBzAMcUw5xVMA')).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("read", read_command))
